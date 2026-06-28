@@ -33,6 +33,42 @@ function money(obj = {}) {
   return v ? `${v} ${c}`.trim() : '—'
 }
 
+// Fetches the live PayPal account balance (primary currency).
+// Returns a formatted string like "1,234.56 USD" or null if unavailable.
+async function getPayPalBalance() {
+  const id = process.env.PAYPAL_CLIENT_ID, secret = process.env.PAYPAL_CLIENT_SECRET
+  if (!id || !secret) { console.log('ℹ️  Balance fetch skipped (PAYPAL_* not set)'); return null }
+  try {
+    const tokRes = await fetch(`${PAYPAL_BASE}/v1/oauth2/token`, {
+      method: 'POST',
+      headers: {
+        Authorization: 'Basic ' + Buffer.from(`${id}:${secret}`).toString('base64'),
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: 'grant_type=client_credentials',
+    })
+    const { access_token } = await tokRes.json()
+    const balRes = await fetch(`${PAYPAL_BASE}/v1/reporting/balances`, {
+      headers: { Authorization: `Bearer ${access_token}` },
+    })
+    if (!balRes.ok) {
+      console.warn('⚠️  Balance API returned HTTP', balRes.status)
+      return null
+    }
+    const data = await balRes.json()
+    // balances is an array; grab the first available balance
+    const primary = data.balances?.[0]
+    if (!primary) return null
+    const val = primary.available_balance ?? primary.total_balance
+    if (!val) return null
+    const num = parseFloat(val.value || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    return `${num} ${val.currency_code || ''}`
+  } catch (e) {
+    console.error('❌ Balance fetch error:', e.message)
+    return null
+  }
+}
+
 // Posts an embed to Discord and LOGS the outcome so you can see problems in Railway logs.
 async function postToDiscord(embed) {
   if (!DISCORD_WEBHOOK) { console.error('❌ DISCORD_WEBHOOK_URL is not set'); return false }
@@ -125,9 +161,12 @@ function invoiceFields(inv) {
   return fields
 }
 
-function buildEmbed(event) {
+function buildEmbed(event, balance = null) {
   const type = event.event_type || 'UNKNOWN'
   const r = event.resource || {}
+  const balanceField = balance
+    ? [{ name: '💰 Account Balance', value: balance, inline: false }]
+    : []
 
   // ── Invoice events (all of them) ──
   if (type.startsWith('INVOICING.')) {
@@ -136,13 +175,29 @@ function buildEmbed(event) {
     const viewUrl = inv.detail?.metadata?.recipient_view_url
       || inv.detail?.metadata?.invoicer_view_url
       || (inv.links || []).find(l => /payer|recipient|view/i.test(l.rel || ''))?.href
+
+    // Pull description + transaction ID for paid invoices
+    const desc = inv.detail?.memo || inv.detail?.note || inv.items?.[0]?.name || null
+    const txnId = inv.payments?.transactions?.[0]?.payment_id
+      || inv.payments?.transactions?.[0]?.transaction_id
+      || null
+    const extraFields = []
+    if (desc) extraFields.push({ name: 'Description', value: String(desc), inline: false })
+    if (txnId) extraFields.push({ name: 'Transaction ID', value: String(txnId), inline: true })
+    // Only show balance on money-moving invoice events
+    const isMoneyEvent = ['INVOICING.INVOICE.PAID', 'INVOICING.INVOICE.REFUNDED'].includes(type)
+
     return {
       author: { name: 'PayPal Invoicing', icon_url: PAYPAL_LOGO },
       title: `${style.emoji} ${style.title}`,
       url: viewUrl || undefined,
       color: style.color,
       thumbnail: { url: PAYPAL_LOGO },
-      fields: invoiceFields(inv),
+      fields: [
+        ...invoiceFields(inv),
+        ...extraFields,
+        ...(isMoneyEvent ? balanceField : []),
+      ],
       footer: { text: 'PayPal', icon_url: PAYPAL_LOGO },
       timestamp: new Date().toISOString(),
     }
@@ -150,16 +205,21 @@ function buildEmbed(event) {
 
   // ── Direct payments (capture / sale completed) ──
   if (type === 'PAYMENT.CAPTURE.COMPLETED' || type === 'PAYMENT.SALE.COMPLETED') {
+    // Description lives in custom_id, soft_descriptor, or the note_to_payer on the order
+    const desc = r.custom_id || r.soft_descriptor || r.description || r.note_to_payer || null
+    const fields = [
+      { name: 'Amount',         value: money(r.amount), inline: true },
+      { name: 'Transaction ID', value: String(r.id || '—'), inline: true },
+      { name: 'From',           value: r.payer?.email_address || r.payer_email || '—', inline: false },
+    ]
+    if (desc) fields.push({ name: 'Description', value: String(desc), inline: false })
+    fields.push(...balanceField)
     return {
       author: { name: 'PayPal Payments', icon_url: PAYPAL_LOGO },
       title: '💸 Payment Received',
       color: 0x00a650,
       thumbnail: { url: PAYPAL_LOGO },
-      fields: [
-        { name: 'Amount',      value: money(r.amount), inline: true },
-        { name: 'Transaction', value: String(r.id || '—'), inline: true },
-        { name: 'From',        value: r.payer?.email_address || r.payer_email || '—', inline: false },
-      ],
+      fields,
       footer: { text: 'PayPal', icon_url: PAYPAL_LOGO },
       timestamp: new Date().toISOString(),
     }
@@ -186,7 +246,16 @@ app.post('/paypal-webhook', async (req, res) => {
   const ok = await verifyPayPalSignature(req, event)
   if (!ok) { console.warn('🚫 Rejected unverified event — not posting to Discord'); return }
 
-  try { await postToDiscord(buildEmbed(event)) } catch (e) { console.error('post failed', e) }
+  // Fetch live balance for money-moving events so the Discord card always shows the up-to-date balance.
+  const BALANCE_EVENTS = new Set([
+    'PAYMENT.CAPTURE.COMPLETED',
+    'PAYMENT.SALE.COMPLETED',
+    'INVOICING.INVOICE.PAID',
+    'INVOICING.INVOICE.REFUNDED',
+  ])
+  const balance = BALANCE_EVENTS.has(event.event_type) ? await getPayPalBalance() : null
+
+  try { await postToDiscord(buildEmbed(event, balance)) } catch (e) { console.error('post failed', e) }
 })
 
 // ── Browser test: hit /test to fire a sample message straight to Discord ──────
