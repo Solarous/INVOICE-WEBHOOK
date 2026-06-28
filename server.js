@@ -41,7 +41,7 @@ async function postToDiscord(embed) {
     const res = await fetch(DISCORD_WEBHOOK, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'PayPal', embeds: [embed] }),
+      body: JSON.stringify({ username: 'PayPal', avatar_url: PAYPAL_LOGO, embeds: [embed] }),
     })
     if (res.ok || res.status === 204) { console.log('✅ Posted to Discord (HTTP', res.status + ')'); return true }
     const body = await res.text().catch(() => '')
@@ -92,37 +92,89 @@ async function verifyPayPalSignature(req, event) {
   }
 }
 
+// PayPal brand assets/colors used to make the Discord cards look official.
+const PAYPAL_LOGO = 'https://www.paypalobjects.com/webstatic/icon/pp258.png'
+const PAYPAL_BLUE = 0x0070ba
+
+// Per-event card styling (emoji + title + color)
+const INVOICE_STYLES = {
+  'INVOICING.INVOICE.CREATED':                 { emoji: '🧾', title: 'Invoice Created',   color: PAYPAL_BLUE },
+  'INVOICING.INVOICE.SENT':                    { emoji: '📨', title: 'Invoice Sent',      color: PAYPAL_BLUE },
+  'INVOICING.INVOICE.SCHEDULED':               { emoji: '📅', title: 'Invoice Scheduled', color: PAYPAL_BLUE },
+  'INVOICING.INVOICE.UPDATED':                 { emoji: '✏️', title: 'Invoice Updated',   color: PAYPAL_BLUE },
+  'INVOICING.INVOICE.AUTOMATIC-REMINDER-SENT': { emoji: '🔔', title: 'Reminder Sent',     color: PAYPAL_BLUE },
+  'INVOICING.INVOICE.PAID':                    { emoji: '✅', title: 'Invoice Paid',       color: 0x00a650 },
+  'INVOICING.INVOICE.UNPAID':                  { emoji: '⚠️', title: 'Invoice Unpaid',    color: 0xf0ad4e },
+  'INVOICING.INVOICE.CANCELLED':               { emoji: '❌', title: 'Invoice Cancelled', color: 0xd9534f },
+  'INVOICING.INVOICE.REFUNDED':                { emoji: '↩️', title: 'Invoice Refunded',  color: 0xff9900 },
+}
+
+function titleCase(s) {
+  return String(s || '').toLowerCase().replace(/(^|\s|_)\w/g, c => c.toUpperCase()).replace(/_/g, ' ')
+}
+
+function invoiceFields(inv) {
+  const fields = []
+  const num = inv.detail?.invoice_number || inv.id
+  if (num) fields.push({ name: 'Invoice #', value: String(num), inline: true })
+  const amt = money(inv.amount || inv.due_amount)
+  if (amt && amt !== '—') fields.push({ name: 'Amount', value: amt, inline: true })
+  if (inv.status) fields.push({ name: 'Status', value: titleCase(inv.status), inline: true })
+  const payer = inv.primary_recipients?.[0]?.billing_info?.email_address
+  if (payer) fields.push({ name: 'Billed to', value: payer, inline: false })
+  return fields
+}
+
 function buildEmbed(event) {
   const type = event.event_type || 'UNKNOWN'
   const r = event.resource || {}
-  if (type === 'INVOICING.INVOICE.PAID') {
+
+  // ── Invoice events (all of them) ──
+  if (type.startsWith('INVOICING.')) {
     const inv = r.invoice || r
-    const link = (inv.links || []).find(l => /payer|view/i.test(l.rel || ''))?.href
-    return { title: '✅ Invoice Paid', color: 0x2ecc71, url: link || undefined, timestamp: new Date().toISOString(),
-      fields: [
-        { name: 'Invoice #', value: String(inv.detail?.invoice_number || inv.id || '—'), inline: true },
-        { name: 'Amount',    value: money(inv.amount), inline: true },
-        { name: 'Payer',     value: inv.primary_recipients?.[0]?.billing_info?.email_address || '—' },
-      ] }
+    const style = INVOICE_STYLES[type] || { emoji: '🧾', title: titleCase(type.replace('INVOICING.INVOICE.', '')), color: PAYPAL_BLUE }
+    const viewUrl = inv.detail?.metadata?.recipient_view_url
+      || inv.detail?.metadata?.invoicer_view_url
+      || (inv.links || []).find(l => /payer|recipient|view/i.test(l.rel || ''))?.href
+    return {
+      author: { name: 'PayPal Invoicing', icon_url: PAYPAL_LOGO },
+      title: `${style.emoji} ${style.title}`,
+      url: viewUrl || undefined,
+      color: style.color,
+      thumbnail: { url: PAYPAL_LOGO },
+      fields: invoiceFields(inv),
+      footer: { text: 'PayPal', icon_url: PAYPAL_LOGO },
+      timestamp: new Date().toISOString(),
+    }
   }
-  if (type === 'INVOICING.INVOICE.CREATED' || type === 'INVOICING.INVOICE.SENT') {
-    const inv = r.invoice || r
-    const link = (inv.links || []).find(l => /payer|view/i.test(l.rel || ''))?.href
-    return { title: type.endsWith('SENT') ? '📨 Invoice Sent' : '🧾 Invoice Created', color: 0xf1c40f, url: link || undefined, timestamp: new Date().toISOString(),
-      fields: [
-        { name: 'Invoice #', value: String(inv.detail?.invoice_number || inv.id || '—'), inline: true },
-        { name: 'Amount',    value: money(inv.amount), inline: true },
-      ] }
-  }
+
+  // ── Direct payments (capture / sale completed) ──
   if (type === 'PAYMENT.CAPTURE.COMPLETED' || type === 'PAYMENT.SALE.COMPLETED') {
-    return { title: '💸 Payment Received', color: 0x3498db, timestamp: new Date().toISOString(),
+    return {
+      author: { name: 'PayPal Payments', icon_url: PAYPAL_LOGO },
+      title: '💸 Payment Received',
+      color: 0x00a650,
+      thumbnail: { url: PAYPAL_LOGO },
       fields: [
         { name: 'Amount',      value: money(r.amount), inline: true },
         { name: 'Transaction', value: String(r.id || '—'), inline: true },
-        { name: 'From',        value: r.payer?.email_address || r.payer_email || '—' },
-      ] }
+        { name: 'From',        value: r.payer?.email_address || r.payer_email || '—', inline: false },
+      ],
+      footer: { text: 'PayPal', icon_url: PAYPAL_LOGO },
+      timestamp: new Date().toISOString(),
+    }
   }
-  return { title: `PayPal event: ${type}`, color: 0x95a5a6, description: 'A new PayPal event was received.', timestamp: new Date().toISOString() }
+
+  // ── Fallback for anything else subscribed ──
+  return {
+    author: { name: 'PayPal', icon_url: PAYPAL_LOGO },
+    title: titleCase(type.replace(/\./g, ' ')),
+    description: 'A new PayPal event was received.',
+    color: PAYPAL_BLUE,
+    thumbnail: { url: PAYPAL_LOGO },
+    footer: { text: 'PayPal', icon_url: PAYPAL_LOGO },
+    timestamp: new Date().toISOString(),
+  }
 }
 
 // ── Webhook endpoint ─────────────────────────────────────────────────────────
