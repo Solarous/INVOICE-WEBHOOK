@@ -56,13 +56,17 @@ async function getPayPalBalance() {
       return null
     }
     const data = await balRes.json()
-    // balances is an array; grab the first available balance
-    const primary = data.balances?.[0]
-    if (!primary) return null
-    const val = primary.available_balance ?? primary.total_balance
-    if (!val) return null
-    const num = parseFloat(val.value || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-    return `${num} ${val.currency_code || ''}`
+    console.log('💳 Balance API raw response:', JSON.stringify(data).slice(0, 500))
+    // Find the primary currency entry, fall back to first if none flagged primary
+    const primary = data.balances?.find(b => b.primary) || data.balances?.[0]
+    if (!primary) { console.warn('⚠️  No balance entries in API response'); return null }
+    // total_balance = sum of all funds (available + withheld) — this is the true account balance
+    const val = primary.total_balance ?? primary.available_balance
+    if (!val || val.value == null) { console.warn('⚠️  Balance value missing in entry:', JSON.stringify(primary)); return null }
+    const num = parseFloat(val.value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    const currency = val.currency_code || primary.currency || ''
+    console.log(`💳 Account balance: ${num} ${currency}`)
+    return `${num} ${currency}`
   } catch (e) {
     console.error('❌ Balance fetch error:', e.message)
     return null
@@ -184,8 +188,6 @@ function buildEmbed(event, balance = null) {
     const extraFields = []
     if (desc) extraFields.push({ name: 'Description', value: String(desc), inline: false })
     if (txnId) extraFields.push({ name: 'Transaction ID', value: String(txnId), inline: true })
-    // Only show balance on money-moving invoice events
-    const isMoneyEvent = ['INVOICING.INVOICE.PAID', 'INVOICING.INVOICE.REFUNDED'].includes(type)
 
     return {
       author: { name: 'PayPal Invoicing', icon_url: PAYPAL_LOGO },
@@ -196,7 +198,7 @@ function buildEmbed(event, balance = null) {
       fields: [
         ...invoiceFields(inv),
         ...extraFields,
-        ...(isMoneyEvent ? balanceField : []),
+        ...balanceField,
       ],
       footer: { text: 'PayPal', icon_url: PAYPAL_LOGO },
       timestamp: new Date().toISOString(),
@@ -232,6 +234,7 @@ function buildEmbed(event, balance = null) {
     description: 'A new PayPal event was received.',
     color: PAYPAL_BLUE,
     thumbnail: { url: PAYPAL_LOGO },
+    fields: [...balanceField],
     footer: { text: 'PayPal', icon_url: PAYPAL_LOGO },
     timestamp: new Date().toISOString(),
   }
@@ -246,14 +249,8 @@ app.post('/paypal-webhook', async (req, res) => {
   const ok = await verifyPayPalSignature(req, event)
   if (!ok) { console.warn('🚫 Rejected unverified event — not posting to Discord'); return }
 
-  // Fetch live balance for money-moving events so the Discord card always shows the up-to-date balance.
-  const BALANCE_EVENTS = new Set([
-    'PAYMENT.CAPTURE.COMPLETED',
-    'PAYMENT.SALE.COMPLETED',
-    'INVOICING.INVOICE.PAID',
-    'INVOICING.INVOICE.REFUNDED',
-  ])
-  const balance = BALANCE_EVENTS.has(event.event_type) ? await getPayPalBalance() : null
+  // Always fetch the live balance so every Discord card shows the current account total.
+  const balance = await getPayPalBalance()
 
   try { await postToDiscord(buildEmbed(event, balance)) } catch (e) { console.error('post failed', e) }
 })
