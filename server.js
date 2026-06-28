@@ -150,6 +150,58 @@ app.get('/test', async (_req, res) => {
     : 'Failed to post to Discord. Check the Railway logs and confirm DISCORD_WEBHOOK_URL is correct. ❌')
 })
 
+// ── One-time setup: register a PayPal "webhook lookup" ───────────────────────
+// Links your PayPal ACCOUNT to this REST app, so invoices/payments you make by
+// hand on paypal.com get delivered to your app's webhook. Visit this once.
+async function getPayPalAccessToken() {
+  const id = process.env.PAYPAL_CLIENT_ID, secret = process.env.PAYPAL_CLIENT_SECRET
+  if (!id || !secret) throw new Error('PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET not set')
+  const res = await fetch(`${PAYPAL_BASE}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      Authorization: 'Basic ' + Buffer.from(`${id}:${secret}`).toString('base64'),
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: 'grant_type=client_credentials',
+  })
+  const data = await res.json()
+  if (!data.access_token) throw new Error('Could not get token: ' + JSON.stringify(data).slice(0, 200))
+  return data.access_token
+}
+
+app.get('/setup-lookup', async (_req, res) => {
+  try {
+    const token = await getPayPalAccessToken()
+    // Create the lookup (empty body = tie to the calling app's own account)
+    const r = await fetch(`${PAYPAL_BASE}/v1/notifications/webhooks-lookup`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: '{}',
+    })
+    const body = await r.text()
+    console.log('🔗 webhook-lookup result:', r.status, body.slice(0, 300))
+    if (r.ok || r.status === 201) {
+      res.send('✅ Webhook lookup created — invoices you make on paypal.com will now be delivered to this app. You can now send a normal invoice and watch it appear in Discord.')
+    } else {
+      res.status(500).send('Lookup request returned HTTP ' + r.status + ':\n\n' + body)
+    }
+  } catch (e) {
+    res.status(500).send('Setup failed: ' + e.message)
+  }
+})
+
+app.get('/list-lookups', async (_req, res) => {
+  try {
+    const token = await getPayPalAccessToken()
+    const r = await fetch(`${PAYPAL_BASE}/v1/notifications/webhooks-lookup`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    res.type('text/plain').send('HTTP ' + r.status + '\n\n' + (await r.text()))
+  } catch (e) {
+    res.status(500).send('Failed: ' + e.message)
+  }
+})
+
 // Health check
 app.get('/', (_req, res) => res.send('PayPal → Discord bridge is running ✅  (try /test)'))
 
